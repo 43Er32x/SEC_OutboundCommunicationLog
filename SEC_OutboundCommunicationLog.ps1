@@ -1,4 +1,3 @@
-﻿clear
 # Définition du répertoire de destination des logs
 $LogFile = "C:\Logs\CommunicationSortante.csv"
 
