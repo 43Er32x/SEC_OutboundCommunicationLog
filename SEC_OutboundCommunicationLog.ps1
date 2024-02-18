@@ -7,14 +7,21 @@ if (-not (Test-Path -Path (Split-Path $LogFile))) {
 }
 
 # Définition de l'en-tête CSV
-$Header = "Timestamp,ProcessName,ProcessId,ProcessPath,LocalAddress,LocalPort,RemoteAddress,RemotePort,Protocol"
+$Header = "Timestamp,ProcessName,ProcessId,ProcessPath,LocalAddress,LocalPort,RemoteAddress,RemotePort,Protocol,VirusTotalHarmless,VirusTotalMalicious,VirusTotalSuspicious,VirusTotalUndetected,VirusTotalTimeout "
 
 # Écriture de l'en-tête dans le fichier de log
 Add-content -Path $LogFile -Value $Header
 
-# Fonction pour vérifier si une adresse IP est de type 127.0.0.1
-function IsLocalhost($ip) {
-    return $ip -eq "127.0.0.1"
+# Fonction pour obtenir le rapport VirusTotal pour une adresse IP
+function GetVirusTotalReport($IPAddress) {
+    $APIKey = "YOUR API KEY"
+    $url = "https://www.virustotal.com/api/v3/ip_addresses/$IPAddress"
+    $headers = @{
+        "x-apikey" = $APIKey
+    }
+
+    $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
+    return $response
 }
 
 # Début de la surveillance des communications sortantes
@@ -28,15 +35,25 @@ while ($true) {
         $Process = Get-Process -Id $ProcessId
         $LocalAddress = $Connection.LocalAddress
         $RemoteAddress = $Connection.RemoteAddress
-        $Protocol = $Connection.Protocol
+        $ProtocolNumber = $Connection.Protocol
         $LocalPort = $Connection.LocalPort
         $RemotePort = $Connection.RemotePort
 
         # Récupération du chemin du processus
         $ProcessPath = $Process.Path
 
+        # Obtention du nom du protocole
+        $Protocol = GetProtocolName $ProtocolNumber
+
+        # Analyse de l'adresse IP de destination avec VirusTotal
+        $VirusTotalHarmless = (GetVirusTotalReport $RemoteAddress).data.attributes.last_analysis_stats.harmless
+        $VirusTotalMalicious = (GetVirusTotalReport $RemoteAddress).data.attributes.last_analysis_stats.malicious
+        $VirusTotalSuspicious = (GetVirusTotalReport $RemoteAddress).data.attributes.last_analysis_stats.suspicious
+        $VirusTotalUndetected = (GetVirusTotalReport $RemoteAddress).data.attributes.last_analysis_stats.undetected
+        $VirusTotalTimeout = (GetVirusTotalReport $RemoteAddress).data.attributes.last_analysis_stats.timeout
+
         # Construction du message à logger
-        $LogMessage = "$((Get-Date).ToString('MM/dd/yyyy HH:mm:ss')), $($Process.Name), $ProcessId, $ProcessPath, $LocalAddress, $LocalPort, $RemoteAddress, $RemotePort, $Protocol"
+        $LogMessage = "$((Get-Date).ToString('MM/dd/yyyy HH:mm:ss')), $($Process.Name), $ProcessId, $ProcessPath, $LocalAddress, $LocalPort, $RemoteAddress, $RemotePort, $Protocol, $VirusTotalHarmless, $VirusTotalMalicious, $VirusTotalSuspicious, $VirusTotalUndetected, $VirusTotalTimeout"
 
         # Écriture du message dans le fichier de log
         Add-content -Path $LogFile -Value $LogMessage
