@@ -1,5 +1,7 @@
+
 # Définition du répertoire de destination des logs
-$LogFile = "C:\Logs\CommunicationSortante.csv"
+$LogFile = "C:\Windows\Logs\SEC\CommunicationSortante.csv"
+
 
 # Vérification de l'existence du répertoire de logs, s'il n'existe pas, on le crée
 if (-not (Test-Path -Path (Split-Path $LogFile))) {
@@ -12,16 +14,24 @@ $Header = "Timestamp,ProcessName,ProcessId,ProcessPath,LocalAddress,LocalPort,Re
 # Écriture de l'en-tête dans le fichier de log
 Add-content -Path $LogFile -Value $Header
 
+# Hashtable pour stocker les rapports VirusTotal déjà récupérés
+$VirusTotalCache = @{}
+
 # Fonction pour obtenir le rapport VirusTotal pour une adresse IP
 function GetVirusTotalReport($IPAddress) {
-    $APIKey = "API KEY"
+    if ($VirusTotalCache.ContainsKey($IPAddress)) {
+        return $VirusTotalCache[$IPAddress]
+    }
+    else{
+    $APIKey = "API TOKEN"
     $url = "https://www.virustotal.com/api/v3/ip_addresses/$IPAddress"
     $headers = @{
         "x-apikey" = $APIKey
-    }
-
+        }
     $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
+    $VirusTotalCache[$IPAddress] = $response
     return $response
+    }
 }
 
 # Début de la surveillance des communications sortantes
@@ -81,3 +91,4 @@ while ($true) {
     # Pause pour éviter une utilisation excessive du processeur
     Start-Sleep -Seconds 5
 }
+
