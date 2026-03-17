@@ -74,8 +74,8 @@ if (-not (Test-Path -Path $OutputDirectory)) {
 function Get-ProcessCpuPercent {
     <#
     .SYNOPSIS
-        Calcule le pourcentage CPU d'un processus entre deux releves.
-        Retourne $null si la valeur ne peut pas etre obtenue.
+        Calcule le % CPU d'un processus entre deux releves via TotalProcessorTime.
+        Retourne $null uniquement si l'acces au processus est vraiment refuse.
     #>
     param(
         [System.Diagnostics.Process]$Process,
@@ -85,79 +85,48 @@ function Get-ProcessCpuPercent {
         [int]$LogicalProcessors
     )
 
-    # Cle composite PID + StartTime pour detecter les recyclages de PID
-    $startTimeTicks = $null
-    try { $startTimeTicks = $Process.StartTime.Ticks } catch { }
-    if ($null -eq $startTimeTicks) {
-        # Impossible de lire StartTime = processus protege, on ne peut pas tracker
-        return $null
-    }
-    $pid_key = "$($Process.Id)_$startTimeTicks"
+    # Refresh pour avoir les compteurs a jour
+    try { $Process.Refresh() } catch { }
 
-    # Refresh() force la relecture des compteurs CPU depuis l'OS
-    try {
-        $Process.Refresh()
-    }
-    catch {
-        return $null
-    }
-
-    # Lecture du TotalProcessorTime — -ErrorAction Stop OBLIGATOIRE sinon l'erreur
-    # est avalee et $currentCpu reste a $null sans entrer dans le catch
+    # Lecture directe de TotalProcessorTime
     $currentCpu = $null
     try {
         $currentCpu = $Process.TotalProcessorTime.TotalMilliseconds
     }
     catch {
-        # Processus protege (SYSTEM, antivirus, PPL, etc.)
-        # Fallback : compteur de performance Windows
+        # Acces refuse (.NET exception) — fallback Get-Counter
         try {
             $counterPath = "\Process($($Process.Name))\% Processor Time"
-            $counterResult = Get-Counter -Counter $counterPath -ErrorAction Stop
-            $sample = $counterResult.CounterSamples[0].CookedValue
-            if ($null -ne $sample) {
-                # Get-Counter retourne un % sur N cores (ex: 200% = 2 cores a fond)
-                return [math]::Round($sample / $LogicalProcessors, 2)
-            }
+            $sample = (Get-Counter -Counter $counterPath -ErrorAction Stop).CounterSamples[0].CookedValue
+            return [math]::Round($sample / $LogicalProcessors, 2)
         }
-        catch { }
-        # Ni TotalProcessorTime ni Get-Counter n'ont fonctionne
-        return $null
-    }
-
-    if ($null -eq $currentCpu) {
-        # $ErrorActionPreference n'etait pas Stop, l'erreur a ete avalee
-        return $null
-    }
-
-    if ($PreviousCpuTimes.ContainsKey($pid_key)) {
-        $prevCpu = $PreviousCpuTimes[$pid_key]
-        $deltaCpuMs = $currentCpu - $prevCpu
-        $deltaTimeMs = ($CurrentTimestamp - $PreviousTimestamp).TotalMilliseconds
-
-        if ($deltaTimeMs -le 0) {
-            $PreviousCpuTimes[$pid_key] = $currentCpu
+        catch {
             return $null
         }
+    }
 
-        if ($deltaCpuMs -lt 0) {
-            # Valeur incohérente (processus recycle, compteur reset)
-            $PreviousCpuTimes[$pid_key] = $currentCpu
-            return $null
-        }
+    # Cle composite PID + StartTime pour detecter recyclage PID
+    $startTicks = 0
+    try { $startTicks = $Process.StartTime.Ticks } catch { }
+    $pid_key = "$($Process.Id)_$startTicks"
+
+    $deltaTimeMs = ($CurrentTimestamp - $PreviousTimestamp).TotalMilliseconds
+
+    if ($PreviousCpuTimes.ContainsKey($pid_key) -and $deltaTimeMs -gt 0) {
+        $deltaCpuMs = $currentCpu - $PreviousCpuTimes[$pid_key]
+        $PreviousCpuTimes[$pid_key] = $currentCpu
+
+        if ($deltaCpuMs -lt 0) { return 0.0 }
 
         $cpuPercent = ($deltaCpuMs / ($deltaTimeMs * $LogicalProcessors)) * 100
-
-        # Clamp entre 0 et 100
         if ($cpuPercent -gt 100) { $cpuPercent = 100 }
-
-        $PreviousCpuTimes[$pid_key] = $currentCpu
         return [math]::Round($cpuPercent, 2)
     }
     else {
-        # Premier releve pour ce processus : baseline seulement, pas de valeur
+        # Pas de baseline = premier releve, on enregistre et on retourne 0
+        # (pas null : le processus tourne, on a juste pas encore de delta)
         $PreviousCpuTimes[$pid_key] = $currentCpu
-        return $null
+        return 0.0
     }
 }
 
@@ -247,56 +216,55 @@ Write-Host "------------------------------------------------------------"
 Write-Host "Demarrage de la collecte..." -ForegroundColor Green
 Write-Host ""
 
-$LogicalProcessors = $null
+# Nombre de processeurs logiques — essai WMI puis fallback .NET
+$LogicalProcessors = 0
 try {
     $LogicalProcessors = (Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop |
         Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
 }
-catch { }
-if (-not $LogicalProcessors -or $LogicalProcessors -eq 0) {
-    try { $LogicalProcessors = [Environment]::ProcessorCount } catch { }
+catch {
+    $LogicalProcessors = [Environment]::ProcessorCount
 }
-if (-not $LogicalProcessors -or $LogicalProcessors -eq 0) {
-    Write-Warning "Impossible de determiner le nombre de processeurs logiques. CPU% ne sera pas disponible."
-    $LogicalProcessors = $null
-}
+if ($LogicalProcessors -le 0) { $LogicalProcessors = [Environment]::ProcessorCount }
+if ($LogicalProcessors -le 0) { $LogicalProcessors = 1 }
+Write-Host "Processeurs logiques : $LogicalProcessors"
 
-$TotalRamBytes = $null
+# RAM totale — essai WMI
+$TotalRamBytes = 0
 try {
     $TotalRamBytes = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory
+    Write-Host "RAM totale           : $([math]::Round($TotalRamBytes / 1GB, 2)) GB"
 }
 catch {
-    Write-Warning "Impossible de determiner la RAM totale. RAM% ne sera pas disponible."
+    Write-Warning "Impossible de determiner la RAM totale. RAM% sera null."
+    $TotalRamBytes = 0
 }
 
 $RawSamples = [System.Collections.ArrayList]::new()
 $PreviousCpuTimes = @{}
 $PreviousTimestamp = Get-Date
 
-# --- Phase de baseline : enregistrer le TotalProcessorTime initial de chaque processus ---
-# Cela permet d'avoir un vrai delta CPU des le premier echantillon.
-if ($null -ne $LogicalProcessors) {
-    Write-Host "Initialisation des baselines CPU..." -ForegroundColor DarkGray
-    foreach ($procName in $ProcessNames) {
-        $procs = $null
-        try { $procs = Get-Process -Name $procName -ErrorAction Stop } catch { }
-        if ($procs) {
-            foreach ($proc in $procs) {
-                try {
-                    $proc.Refresh()
-                    $stTicks = $proc.StartTime.Ticks
-                    $pid_key = "$($proc.Id)_$stTicks"
-                    $PreviousCpuTimes[$pid_key] = $proc.TotalProcessorTime.TotalMilliseconds
-                    Write-Host "  Baseline OK : $($proc.Name) (PID $($proc.Id))" -ForegroundColor DarkGray
-                }
-                catch {
-                    Write-Host "  Baseline IMPOSSIBLE : $($proc.Name) (PID $($proc.Id)) - acces refuse" -ForegroundColor DarkYellow
-                }
-            }
+# --- Phase de baseline CPU : on capture TotalProcessorTime avant le 1er echantillon ---
+Write-Host "Initialisation des baselines CPU..." -ForegroundColor DarkGray
+foreach ($procName in $ProcessNames) {
+    $procs = Get-Process -Name $procName -ErrorAction SilentlyContinue
+    if (-not $procs) {
+        Write-Host "  $procName : non trouve (sera retente pendant la collecte)" -ForegroundColor DarkGray
+        continue
+    }
+    foreach ($proc in $procs) {
+        try {
+            $proc.Refresh()
+            $stTicks = 0
+            try { $stTicks = $proc.StartTime.Ticks } catch { }
+            $pid_key = "$($proc.Id)_$stTicks"
+            $PreviousCpuTimes[$pid_key] = $proc.TotalProcessorTime.TotalMilliseconds
+            Write-Host "  OK : $($proc.Name) (PID $($proc.Id)) - CPU baseline = $([math]::Round($PreviousCpuTimes[$pid_key]))ms" -ForegroundColor DarkGray
+        }
+        catch {
+            Write-Host "  ECHEC : $($proc.Name) (PID $($proc.Id)) - $($_.Exception.Message)" -ForegroundColor Yellow
         }
     }
-} else {
-    Write-Host "Pas de baseline CPU (nombre de processeurs inconnu)." -ForegroundColor DarkYellow
 }
 Start-Sleep -Seconds $IntervalSeconds
 $PreviousTimestamp = Get-Date
@@ -309,8 +277,7 @@ while ((Get-Date) -lt $StartTime.AddSeconds($DurationSeconds)) {
     $SampleIndex++
 
     foreach ($procName in $ProcessNames) {
-        $processes = $null
-        try { $processes = Get-Process -Name $procName -ErrorAction Stop } catch { }
+        $processes = Get-Process -Name $procName -ErrorAction SilentlyContinue
 
         if (-not $processes) {
             # Processus non trouve — tout a $null sauf les identifiants
@@ -340,7 +307,10 @@ while ((Get-Date) -lt $StartTime.AddSeconds($DurationSeconds)) {
         }
 
         foreach ($proc in $processes) {
-            # CPU
+            # Refresh une seule fois — les proprietes .NET sont ensuite a jour
+            try { $proc.Refresh() } catch { }
+
+            # === CPU ===
             $cpuPercent = $null
             if ($null -ne $LogicalProcessors) {
                 $cpuPercent = Get-ProcessCpuPercent -Process $proc `
@@ -350,44 +320,34 @@ while ((Get-Date) -lt $StartTime.AddSeconds($DurationSeconds)) {
                     -LogicalProcessors $LogicalProcessors
             }
 
-            # RAM — chaque propriete lue individuellement
-            $ramMB = $null
-            $ramPercent = $null
-            $privateBytesMB = $null
-            $virtualMB = $null
-            try {
-                $proc.Refresh()
-                $ws = $proc.WorkingSet64
-                $ramMB = [math]::Round($ws / 1MB, 2)
-                if ($null -ne $TotalRamBytes -and $TotalRamBytes -gt 0) {
-                    $ramPercent = [math]::Round(($ws / $TotalRamBytes) * 100, 2)
-                }
-                $privateBytesMB = [math]::Round($proc.PrivateMemorySize64 / 1MB, 2)
-                $virtualMB = [math]::Round($proc.VirtualMemorySize64 / 1MB, 2)
+            # === RAM === (lectures directes, isolees)
+            $ramMB          = try { [math]::Round($proc.WorkingSet64 / 1MB, 2) } catch { $null }
+            $ramPercent     = $null
+            if ($null -ne $ramMB -and $TotalRamBytes -gt 0) {
+                $ramPercent = try { [math]::Round(($proc.WorkingSet64 / $TotalRamBytes) * 100, 2) } catch { $null }
             }
-            catch { }
+            $privateBytesMB = try { [math]::Round($proc.PrivateMemorySize64 / 1MB, 2) } catch { $null }
+            $virtualMB      = try { [math]::Round($proc.VirtualMemorySize64 / 1MB, 2) } catch { $null }
 
-            # Threads / Handles
-            $threadCount = $null
-            $handleCount = $null
-            try { $threadCount = $proc.Threads.Count } catch { }
-            try { $handleCount = $proc.HandleCount } catch { }
+            # === Threads / Handles === (lecture directe)
+            $threadCount = try { $proc.Threads.Count } catch { $null }
+            $handleCount = try { $proc.HandleCount } catch { $null }
 
-            # GPU
+            # === GPU === (compteurs perf — null si pas de GPU ou compteurs absents)
             $gpuInfo = Get-GpuUsageForProcess -ProcessId $proc.Id
             $gpuMemoryMB = $null
             if ($null -ne $gpuInfo.GpuMemoryBytes) {
                 $gpuMemoryMB = [math]::Round($gpuInfo.GpuMemoryBytes / 1MB, 2)
             }
 
-            # IO
+            # === IO === (compteurs perf — null si compteurs absents)
             $ioInfo = Get-ProcessIOCounters -Process $proc
 
-            # Page faults
+            # === Page Faults === (compteur perf — null si absent)
             $pageFaults = $null
             try {
                 $pfResult = Get-Counter -Counter "\Process($($proc.Name))\Page Faults/sec" -ErrorAction Stop
-                if ($pfResult -and $pfResult.CounterSamples -and $pfResult.CounterSamples[0]) {
+                if ($pfResult.CounterSamples[0]) {
                     $pageFaults = [math]::Round($pfResult.CounterSamples[0].CookedValue, 0)
                 }
             }
