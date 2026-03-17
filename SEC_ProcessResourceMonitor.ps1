@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Monitore la consommation CPU/RAM/GPU/IO d'une liste de processus sur une duree configurable.
@@ -10,6 +11,9 @@
       - Un rapport filtre (pattern)
       - Un rapport total (toutes metriques agregees)
     L'export se fait en CSV (compatible BI : Power BI, Tableau, etc.) et optionnellement en JSON.
+
+    IMPORTANT : Ce script necessite les droits administrateur pour acceder aux compteurs
+    de performance et aux proprietes des processus proteges.
 
 .PARAMETER ProcessNames
     Liste des noms de processus a surveiller (sans extension .exe).
@@ -56,10 +60,96 @@ param(
 )
 
 # ============================================================================
+# Elevation admin : auto-relance en admin si pas deja eleve
+# ============================================================================
+$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+$isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin) {
+    Write-Warning "Le script n'a pas les droits administrateur. Relance en mode eleve..."
+    $scriptPath = $MyInvocation.MyCommand.Path
+    $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+    # Repasser tous les parametres
+    foreach ($key in $PSBoundParameters.Keys) {
+        $val = $PSBoundParameters[$key]
+        if ($val -is [string[]]) {
+            $argList += " -$key " + (($val | ForEach-Object { "`"$_`"" }) -join ",")
+        }
+        elseif ($val -is [string]) {
+            $argList += " -$key `"$val`""
+        }
+        else {
+            $argList += " -$key $val"
+        }
+    }
+    try {
+        Start-Process -FilePath "powershell.exe" -ArgumentList $argList -Verb RunAs -Wait
+    }
+    catch {
+        Write-Error "Impossible d'obtenir les droits administrateur. Lancez le script depuis une console admin."
+    }
+    exit
+}
+
+Write-Host "[OK] Droits administrateur confirmes." -ForegroundColor Green
+
+# Activer le privilege SeDebugPrivilege pour acceder aux processus proteges (antivirus, agents, etc.)
+$privCode = @'
+using System;
+using System.Runtime.InteropServices;
+public class TokenPrivilege {
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out long lpLuid);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct TOKEN_PRIVILEGES {
+        public uint PrivilegeCount;
+        public long Luid;
+        public uint Attributes;
+    }
+
+    public static bool EnableDebugPrivilege() {
+        IntPtr token;
+        if (!OpenProcessToken(GetCurrentProcess(), 0x0020 | 0x0008, out token)) return false;
+        TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES();
+        tp.PrivilegeCount = 1;
+        tp.Attributes = 0x00000002; // SE_PRIVILEGE_ENABLED
+        if (!LookupPrivilegeValue(null, "SeDebugPrivilege", out tp.Luid)) return false;
+        return AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+    }
+}
+'@
+
+try {
+    Add-Type -TypeDefinition $privCode -Language CSharp -ErrorAction Stop
+    $debugResult = [TokenPrivilege]::EnableDebugPrivilege()
+    if ($debugResult) {
+        Write-Host "[OK] SeDebugPrivilege active — acces complet aux processus proteges." -ForegroundColor Green
+    }
+    else {
+        Write-Warning "SeDebugPrivilege non active. Certains processus proteges pourraient etre inaccessibles."
+    }
+}
+catch {
+    # Type deja charge (relance du script) ou erreur de compilation
+    try {
+        [TokenPrivilege]::EnableDebugPrivilege() | Out-Null
+        Write-Host "[OK] SeDebugPrivilege active." -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "SeDebugPrivilege non disponible : $($_.Exception.Message)"
+    }
+}
+
+# ============================================================================
 # Configuration
 # ============================================================================
-# PAS de $ErrorActionPreference = "SilentlyContinue" global.
-# Chaque appel gere ses erreurs explicitement avec -ErrorAction Stop + try/catch.
 $ErrorActionPreference = "Continue"
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 
@@ -266,6 +356,28 @@ foreach ($procName in $ProcessNames) {
         }
     }
 }
+# --- Diagnostic rapide : verifier qu'on peut lire les proprietes ---
+Write-Host ""
+Write-Host "Verification des acces processus..." -ForegroundColor DarkGray
+foreach ($procName in $ProcessNames) {
+    $procs = Get-Process -Name $procName -ErrorAction SilentlyContinue
+    if (-not $procs) { continue }
+    $p = $procs[0]
+    try { $p.Refresh() } catch { }
+    $diag = @{}
+    try { $diag["CPU_ms"]  = [math]::Round($p.TotalProcessorTime.TotalMilliseconds) } catch { $diag["CPU_ms"]  = "ECHEC: $($_.Exception.Message)" }
+    try { $diag["RAM_MB"]  = [math]::Round($p.WorkingSet64 / 1MB, 1) }               catch { $diag["RAM_MB"]  = "ECHEC: $($_.Exception.Message)" }
+    try { $diag["Threads"] = $p.Threads.Count }                                       catch { $diag["Threads"] = "ECHEC: $($_.Exception.Message)" }
+    try { $diag["Handles"] = $p.HandleCount }                                         catch { $diag["Handles"] = "ECHEC: $($_.Exception.Message)" }
+    try { $diag["Path"]    = $p.Path }                                                catch { $diag["Path"]    = "ECHEC: $($_.Exception.Message)" }
+    Write-Host "  $($p.Name) (PID $($p.Id)) :" -ForegroundColor White
+    foreach ($k in $diag.Keys) {
+        $color = if ($diag[$k] -is [string] -and $diag[$k].StartsWith("ECHEC")) { "Red" } else { "Green" }
+        Write-Host "    $k = $($diag[$k])" -ForegroundColor $color
+    }
+}
+Write-Host ""
+
 Start-Sleep -Seconds $IntervalSeconds
 $PreviousTimestamp = Get-Date
 
