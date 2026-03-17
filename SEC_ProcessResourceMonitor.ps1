@@ -58,7 +58,9 @@ param(
 # ============================================================================
 # Configuration
 # ============================================================================
-$ErrorActionPreference = "SilentlyContinue"
+# PAS de $ErrorActionPreference = "SilentlyContinue" global.
+# Chaque appel gere ses erreurs explicitement avec -ErrorAction Stop + try/catch.
+$ErrorActionPreference = "Continue"
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 
 if (-not (Test-Path -Path $OutputDirectory)) {
@@ -73,7 +75,7 @@ function Get-ProcessCpuPercent {
     <#
     .SYNOPSIS
         Calcule le pourcentage CPU d'un processus entre deux releves.
-        Utilise le temps reel ecoule et Refresh() pour des valeurs fiables.
+        Retourne $null si la valeur ne peut pas etre obtenue.
     #>
     param(
         [System.Diagnostics.Process]$Process,
@@ -84,82 +86,108 @@ function Get-ProcessCpuPercent {
     )
 
     # Cle composite PID + StartTime pour detecter les recyclages de PID
-    $startTimeTicks = 0
+    $startTimeTicks = $null
     try { $startTimeTicks = $Process.StartTime.Ticks } catch { }
+    if ($null -eq $startTimeTicks) {
+        # Impossible de lire StartTime = processus protege, on ne peut pas tracker
+        return $null
+    }
     $pid_key = "$($Process.Id)_$startTimeTicks"
 
     # Refresh() force la relecture des compteurs CPU depuis l'OS
-    try { $Process.Refresh() } catch { }
+    try {
+        $Process.Refresh()
+    }
+    catch {
+        return $null
+    }
 
-    $currentCpu = 0.0
+    # Lecture du TotalProcessorTime — -ErrorAction Stop OBLIGATOIRE sinon l'erreur
+    # est avalee et $currentCpu reste a $null sans entrer dans le catch
+    $currentCpu = $null
     try {
         $currentCpu = $Process.TotalProcessorTime.TotalMilliseconds
     }
     catch {
-        # Processus protege (SYSTEM, antivirus, etc.) : fallback compteur perf
+        # Processus protege (SYSTEM, antivirus, PPL, etc.)
+        # Fallback : compteur de performance Windows
         try {
             $counterPath = "\Process($($Process.Name))\% Processor Time"
-            $sample = (Get-Counter -Counter $counterPath -ErrorAction Stop).CounterSamples[0].CookedValue
-            # Get-Counter retourne un % sur N cores (ex: 200% = 2 cores a fond)
-            # On normalise sur 100%
-            return [math]::Round($sample / $LogicalProcessors, 2)
-        }
-        catch {
-            if ($PreviousCpuTimes.ContainsKey($pid_key)) {
-                $PreviousCpuTimes.Remove($pid_key)
+            $counterResult = Get-Counter -Counter $counterPath -ErrorAction Stop
+            $sample = $counterResult.CounterSamples[0].CookedValue
+            if ($null -ne $sample) {
+                # Get-Counter retourne un % sur N cores (ex: 200% = 2 cores a fond)
+                return [math]::Round($sample / $LogicalProcessors, 2)
             }
-            return 0.0
         }
+        catch { }
+        # Ni TotalProcessorTime ni Get-Counter n'ont fonctionne
+        return $null
+    }
+
+    if ($null -eq $currentCpu) {
+        # $ErrorActionPreference n'etait pas Stop, l'erreur a ete avalee
+        return $null
     }
 
     if ($PreviousCpuTimes.ContainsKey($pid_key)) {
-        $deltaCpuMs = $currentCpu - $PreviousCpuTimes[$pid_key]
+        $prevCpu = $PreviousCpuTimes[$pid_key]
+        $deltaCpuMs = $currentCpu - $prevCpu
         $deltaTimeMs = ($CurrentTimestamp - $PreviousTimestamp).TotalMilliseconds
 
-        if ($deltaTimeMs -gt 0 -and $deltaCpuMs -ge 0) {
-            $cpuPercent = ($deltaCpuMs / ($deltaTimeMs * $LogicalProcessors)) * 100
+        if ($deltaTimeMs -le 0) {
+            $PreviousCpuTimes[$pid_key] = $currentCpu
+            return $null
         }
-        else {
-            $cpuPercent = 0
+
+        if ($deltaCpuMs -lt 0) {
+            # Valeur incohérente (processus recycle, compteur reset)
+            $PreviousCpuTimes[$pid_key] = $currentCpu
+            return $null
         }
+
+        $cpuPercent = ($deltaCpuMs / ($deltaTimeMs * $LogicalProcessors)) * 100
 
         # Clamp entre 0 et 100
-        if ($cpuPercent -lt 0) { $cpuPercent = 0 }
         if ($cpuPercent -gt 100) { $cpuPercent = 100 }
+
+        $PreviousCpuTimes[$pid_key] = $currentCpu
+        return [math]::Round($cpuPercent, 2)
     }
     else {
-        # Premier releve pour ce processus : on enregistre la baseline, pas de calcul
-        $cpuPercent = 0
+        # Premier releve pour ce processus : baseline seulement, pas de valeur
+        $PreviousCpuTimes[$pid_key] = $currentCpu
+        return $null
     }
-
-    $PreviousCpuTimes[$pid_key] = $currentCpu
-    return [math]::Round($cpuPercent, 2)
 }
 
 function Get-GpuUsageForProcess {
     <#
     .SYNOPSIS
         Recupere l'utilisation GPU d'un processus via les compteurs de performance.
-        Retourne un objet avec GPU Engine (3D/Compute/etc.) et GPU Memory.
+        Retourne $null pour chaque metrique non disponible.
     #>
     param([int]$ProcessId)
 
-    $gpuEngine = 0.0
-    $gpuMemory = 0
+    $gpuEngine = $null
+    $gpuMemory = $null
 
     try {
-        $counters = Get-Counter -Counter "\GPU Engine(pid_${ProcessId}_*)\Utilization Percentage" -ErrorAction SilentlyContinue
-        if ($counters) {
+        $counters = Get-Counter -Counter "\GPU Engine(pid_${ProcessId}_*)\Utilization Percentage" -ErrorAction Stop
+        if ($counters -and $counters.CounterSamples) {
+            $gpuEngine = 0.0
             foreach ($sample in $counters.CounterSamples) {
                 $gpuEngine += $sample.CookedValue
             }
+            $gpuEngine = [math]::Round($gpuEngine, 2)
         }
     }
     catch { }
 
     try {
-        $memCounters = Get-Counter -Counter "\GPU Process Memory(pid_${ProcessId}_*)\Dedicated Usage" -ErrorAction SilentlyContinue
-        if ($memCounters) {
+        $memCounters = Get-Counter -Counter "\GPU Process Memory(pid_${ProcessId}_*)\Dedicated Usage" -ErrorAction Stop
+        if ($memCounters -and $memCounters.CounterSamples) {
+            $gpuMemory = [long]0
             foreach ($sample in $memCounters.CounterSamples) {
                 $gpuMemory += $sample.CookedValue
             }
@@ -168,36 +196,35 @@ function Get-GpuUsageForProcess {
     catch { }
 
     return @{
-        GpuEnginePercent = [math]::Round($gpuEngine, 2)
-        GpuMemoryBytes   = [long]$gpuMemory
+        GpuEnginePercent = $gpuEngine
+        GpuMemoryBytes   = $gpuMemory
     }
 }
 
 function Get-ProcessIOCounters {
     <#
     .SYNOPSIS
-        Recupere les compteurs IO via les proprietes .NET du processus.
+        Recupere les compteurs IO. Retourne $null pour chaque metrique non disponible.
     #>
     param([System.Diagnostics.Process]$Process)
 
+    $readBytes = $null
+    $writeBytes = $null
+
     try {
-        # Ces proprietes ne sont pas exposees directement en .NET sur toutes les versions.
-        # On utilise les compteurs de performance comme fallback.
-        $counter = Get-Counter -Counter "\Process($($Process.Name))\IO Read Bytes/sec", "\Process($($Process.Name))\IO Write Bytes/sec" -ErrorAction SilentlyContinue
-        if ($counter) {
-            $readBytes = ($counter.CounterSamples | Where-Object { $_.Path -like "*read*" }).CookedValue
-            $writeBytes = ($counter.CounterSamples | Where-Object { $_.Path -like "*write*" }).CookedValue
-            return @{
-                IOReadBytesPerSec  = [math]::Round($readBytes, 0)
-                IOWriteBytesPerSec = [math]::Round($writeBytes, 0)
-            }
+        $counter = Get-Counter -Counter "\Process($($Process.Name))\IO Read Bytes/sec", "\Process($($Process.Name))\IO Write Bytes/sec" -ErrorAction Stop
+        if ($counter -and $counter.CounterSamples) {
+            $readSample = ($counter.CounterSamples | Where-Object { $_.Path -like "*read*" })
+            $writeSample = ($counter.CounterSamples | Where-Object { $_.Path -like "*write*" })
+            if ($readSample) { $readBytes = [math]::Round($readSample.CookedValue, 0) }
+            if ($writeSample) { $writeBytes = [math]::Round($writeSample.CookedValue, 0) }
         }
     }
     catch { }
 
     return @{
-        IOReadBytesPerSec  = 0
-        IOWriteBytesPerSec = 0
+        IOReadBytesPerSec  = $readBytes
+        IOWriteBytesPerSec = $writeBytes
     }
 }
 
@@ -220,21 +247,26 @@ Write-Host "------------------------------------------------------------"
 Write-Host "Demarrage de la collecte..." -ForegroundColor Green
 Write-Host ""
 
-$LogicalProcessors = (Get-CimInstance -ClassName Win32_Processor -ErrorAction SilentlyContinue |
-    Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+$LogicalProcessors = $null
+try {
+    $LogicalProcessors = (Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop |
+        Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+}
+catch { }
 if (-not $LogicalProcessors -or $LogicalProcessors -eq 0) {
-    $LogicalProcessors = [Environment]::ProcessorCount
+    try { $LogicalProcessors = [Environment]::ProcessorCount } catch { }
 }
 if (-not $LogicalProcessors -or $LogicalProcessors -eq 0) {
-    $LogicalProcessors = 1
+    Write-Warning "Impossible de determiner le nombre de processeurs logiques. CPU% ne sera pas disponible."
+    $LogicalProcessors = $null
 }
 
-$TotalRamBytes = 0
+$TotalRamBytes = $null
 try {
-    $TotalRamBytes = (Get-CimInstance -ClassName Win32_ComputerSystem).TotalPhysicalMemory
+    $TotalRamBytes = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory
 }
 catch {
-    $TotalRamBytes = 8GB  # fallback
+    Write-Warning "Impossible de determiner la RAM totale. RAM% ne sera pas disponible."
 }
 
 $RawSamples = [System.Collections.ArrayList]::new()
@@ -243,21 +275,28 @@ $PreviousTimestamp = Get-Date
 
 # --- Phase de baseline : enregistrer le TotalProcessorTime initial de chaque processus ---
 # Cela permet d'avoir un vrai delta CPU des le premier echantillon.
-Write-Host "Initialisation des baselines CPU..." -ForegroundColor DarkGray
-foreach ($procName in $ProcessNames) {
-    $processes = Get-Process -Name $procName -ErrorAction SilentlyContinue
-    if ($processes) {
-        foreach ($proc in $processes) {
-            try { $proc.Refresh() } catch { }
-            $startTimeTicks = 0
-            try { $startTimeTicks = $proc.StartTime.Ticks } catch { }
-            $pid_key = "$($proc.Id)_$startTimeTicks"
-            try {
-                $PreviousCpuTimes[$pid_key] = $proc.TotalProcessorTime.TotalMilliseconds
+if ($null -ne $LogicalProcessors) {
+    Write-Host "Initialisation des baselines CPU..." -ForegroundColor DarkGray
+    foreach ($procName in $ProcessNames) {
+        $procs = $null
+        try { $procs = Get-Process -Name $procName -ErrorAction Stop } catch { }
+        if ($procs) {
+            foreach ($proc in $procs) {
+                try {
+                    $proc.Refresh()
+                    $stTicks = $proc.StartTime.Ticks
+                    $pid_key = "$($proc.Id)_$stTicks"
+                    $PreviousCpuTimes[$pid_key] = $proc.TotalProcessorTime.TotalMilliseconds
+                    Write-Host "  Baseline OK : $($proc.Name) (PID $($proc.Id))" -ForegroundColor DarkGray
+                }
+                catch {
+                    Write-Host "  Baseline IMPOSSIBLE : $($proc.Name) (PID $($proc.Id)) - acces refuse" -ForegroundColor DarkYellow
+                }
             }
-            catch { }
         }
     }
+} else {
+    Write-Host "Pas de baseline CPU (nombre de processeurs inconnu)." -ForegroundColor DarkYellow
 }
 Start-Sleep -Seconds $IntervalSeconds
 $PreviousTimestamp = Get-Date
@@ -270,62 +309,87 @@ while ((Get-Date) -lt $StartTime.AddSeconds($DurationSeconds)) {
     $SampleIndex++
 
     foreach ($procName in $ProcessNames) {
-        $processes = Get-Process -Name $procName -ErrorAction SilentlyContinue
+        $processes = $null
+        try { $processes = Get-Process -Name $procName -ErrorAction Stop } catch { }
 
         if (-not $processes) {
-            # Processus non trouve, on enregistre une ligne a zero
+            # Processus non trouve — tout a $null sauf les identifiants
             $sample = [PSCustomObject]@{
                 SampleIndex         = $SampleIndex
                 Timestamp           = $SampleTimestamp.ToString("yyyy-MM-dd HH:mm:ss.fff")
                 TimestampUTC        = $SampleTimestamp.ToUniversalTime().ToString("o")
                 ProcessName         = $procName
-                PID                 = -1
+                PID                 = $null
                 Status              = "NotRunning"
-                CpuPercent          = 0
-                RamMB               = 0
-                RamPercent          = 0
-                WorkingSetMB        = 0
-                PrivateBytesMB      = 0
-                VirtualMemoryMB     = 0
-                ThreadCount         = 0
-                HandleCount         = 0
-                GpuEnginePercent    = 0
-                GpuMemoryMB         = 0
-                IOReadBytesPerSec   = 0
-                IOWriteBytesPerSec  = 0
-                PageFaults          = 0
+                CpuPercent          = $null
+                RamMB               = $null
+                RamPercent          = $null
+                WorkingSetMB        = $null
+                PrivateBytesMB      = $null
+                VirtualMemoryMB     = $null
+                ThreadCount         = $null
+                HandleCount         = $null
+                GpuEnginePercent    = $null
+                GpuMemoryMB         = $null
+                IOReadBytesPerSec   = $null
+                IOWriteBytesPerSec  = $null
+                PageFaults          = $null
             }
             [void]$RawSamples.Add($sample)
             continue
         }
 
         foreach ($proc in $processes) {
-            # CPU — utilise le vrai temps ecoule entre echantillons
-            $cpuPercent = Get-ProcessCpuPercent -Process $proc `
-                -PreviousCpuTimes $PreviousCpuTimes `
-                -PreviousTimestamp $PreviousTimestamp `
-                -CurrentTimestamp $SampleTimestamp `
-                -LogicalProcessors $LogicalProcessors
+            # CPU
+            $cpuPercent = $null
+            if ($null -ne $LogicalProcessors) {
+                $cpuPercent = Get-ProcessCpuPercent -Process $proc `
+                    -PreviousCpuTimes $PreviousCpuTimes `
+                    -PreviousTimestamp $PreviousTimestamp `
+                    -CurrentTimestamp $SampleTimestamp `
+                    -LogicalProcessors $LogicalProcessors
+            }
 
-            # RAM
-            $ramBytes = $proc.WorkingSet64
-            $ramMB = [math]::Round($ramBytes / 1MB, 2)
-            $ramPercent = [math]::Round(($ramBytes / $TotalRamBytes) * 100, 2)
-            $privateBytesMB = [math]::Round($proc.PrivateMemorySize64 / 1MB, 2)
-            $virtualMB = [math]::Round($proc.VirtualMemorySize64 / 1MB, 2)
+            # RAM — chaque propriete lue individuellement
+            $ramMB = $null
+            $ramPercent = $null
+            $privateBytesMB = $null
+            $virtualMB = $null
+            try {
+                $proc.Refresh()
+                $ws = $proc.WorkingSet64
+                $ramMB = [math]::Round($ws / 1MB, 2)
+                if ($null -ne $TotalRamBytes -and $TotalRamBytes -gt 0) {
+                    $ramPercent = [math]::Round(($ws / $TotalRamBytes) * 100, 2)
+                }
+                $privateBytesMB = [math]::Round($proc.PrivateMemorySize64 / 1MB, 2)
+                $virtualMB = [math]::Round($proc.VirtualMemorySize64 / 1MB, 2)
+            }
+            catch { }
+
+            # Threads / Handles
+            $threadCount = $null
+            $handleCount = $null
+            try { $threadCount = $proc.Threads.Count } catch { }
+            try { $handleCount = $proc.HandleCount } catch { }
 
             # GPU
             $gpuInfo = Get-GpuUsageForProcess -ProcessId $proc.Id
-            $gpuMemoryMB = [math]::Round($gpuInfo.GpuMemoryBytes / 1MB, 2)
+            $gpuMemoryMB = $null
+            if ($null -ne $gpuInfo.GpuMemoryBytes) {
+                $gpuMemoryMB = [math]::Round($gpuInfo.GpuMemoryBytes / 1MB, 2)
+            }
 
             # IO
             $ioInfo = Get-ProcessIOCounters -Process $proc
 
-            # Page faults (non-paged pool)
-            $pageFaults = 0
+            # Page faults
+            $pageFaults = $null
             try {
-                $pageFaults = (Get-Counter -Counter "\Process($($proc.Name))\Page Faults/sec" -ErrorAction SilentlyContinue).CounterSamples[0].CookedValue
-                $pageFaults = [math]::Round($pageFaults, 0)
+                $pfResult = Get-Counter -Counter "\Process($($proc.Name))\Page Faults/sec" -ErrorAction Stop
+                if ($pfResult -and $pfResult.CounterSamples -and $pfResult.CounterSamples[0]) {
+                    $pageFaults = [math]::Round($pfResult.CounterSamples[0].CookedValue, 0)
+                }
             }
             catch { }
 
@@ -342,8 +406,8 @@ while ((Get-Date) -lt $StartTime.AddSeconds($DurationSeconds)) {
                 WorkingSetMB        = $ramMB
                 PrivateBytesMB      = $privateBytesMB
                 VirtualMemoryMB     = $virtualMB
-                ThreadCount         = $proc.Threads.Count
-                HandleCount         = $proc.HandleCount
+                ThreadCount         = $threadCount
+                HandleCount         = $handleCount
                 GpuEnginePercent    = $gpuInfo.GpuEnginePercent
                 GpuMemoryMB         = $gpuMemoryMB
                 IOReadBytesPerSec   = $ioInfo.IOReadBytesPerSec
@@ -371,6 +435,49 @@ Write-Host "Collecte terminee : $($RawSamples.Count) mesures sur $SampleIndex ec
 Write-Host ""
 
 # ============================================================================
+# Fonctions d'agregation null-safe
+# ============================================================================
+
+function SafeAgg {
+    <#
+    .SYNOPSIS
+        Agrege une propriete en ignorant les $null. Retourne $null si aucune valeur valide.
+    #>
+    param(
+        [object[]]$Data,
+        [string]$Property,
+        [ValidateSet("Average","Maximum","Minimum","Sum")]
+        [string]$Stat,
+        [int]$Decimals = 2
+    )
+    $valid = $Data | Where-Object { $null -ne $_.$Property } | Select-Object -ExpandProperty $Property
+    if (-not $valid -or @($valid).Count -eq 0) { return $null }
+    $result = ($valid | Measure-Object -$Stat).$Stat
+    if ($null -eq $result) { return $null }
+    return [math]::Round($result, $Decimals)
+}
+
+function SafeP95 {
+    param([object[]]$Data, [string]$Property)
+    $valid = $Data | Where-Object { $null -ne $_.$Property } | Sort-Object $Property
+    if (-not $valid -or @($valid).Count -eq 0) { return $null }
+    $arr = @($valid)
+    $idx = [math]::Floor($arr.Count * 0.95)
+    if ($idx -ge $arr.Count) { $idx = $arr.Count - 1 }
+    return [math]::Round($arr[$idx].$Property, 2)
+}
+
+function Format-Val {
+    <#
+    .SYNOPSIS
+        Affiche une valeur ou "null" si $null.
+    #>
+    param($Value, [string]$Suffix = "")
+    if ($null -eq $Value) { return "null" }
+    return "$Value$Suffix"
+}
+
+# ============================================================================
 # Rapport 1 : Stats par processus
 # ============================================================================
 
@@ -381,7 +488,7 @@ $StatsPerProcess = $RawSamples |
     Group-Object -Property ProcessName |
     ForEach-Object {
         $groupName = $_.Name
-        $groupData = $_.Group
+        $groupData = @($_.Group)
         $count = $groupData.Count
 
         [PSCustomObject]@{
@@ -391,27 +498,27 @@ $StatsPerProcess = $RawSamples |
             AnalysisDurationSec = $DurationSeconds
             IntervalSec         = $IntervalSeconds
             # CPU
-            CpuPercent_Avg      = [math]::Round(($groupData | Measure-Object -Property CpuPercent -Average).Average, 2)
-            CpuPercent_Max      = [math]::Round(($groupData | Measure-Object -Property CpuPercent -Maximum).Maximum, 2)
-            CpuPercent_Min      = [math]::Round(($groupData | Measure-Object -Property CpuPercent -Minimum).Minimum, 2)
-            CpuPercent_P95      = [math]::Round(($groupData | Sort-Object CpuPercent | Select-Object -Skip ([math]::Floor($count * 0.95)) -First 1).CpuPercent, 2)
+            CpuPercent_Avg      = SafeAgg $groupData "CpuPercent" "Average"
+            CpuPercent_Max      = SafeAgg $groupData "CpuPercent" "Maximum"
+            CpuPercent_Min      = SafeAgg $groupData "CpuPercent" "Minimum"
+            CpuPercent_P95      = SafeP95 $groupData "CpuPercent"
             # RAM
-            RamMB_Avg           = [math]::Round(($groupData | Measure-Object -Property RamMB -Average).Average, 2)
-            RamMB_Max           = [math]::Round(($groupData | Measure-Object -Property RamMB -Maximum).Maximum, 2)
-            RamPercent_Avg      = [math]::Round(($groupData | Measure-Object -Property RamPercent -Average).Average, 2)
-            PrivateBytesMB_Avg  = [math]::Round(($groupData | Measure-Object -Property PrivateBytesMB -Average).Average, 2)
-            VirtualMemoryMB_Avg = [math]::Round(($groupData | Measure-Object -Property VirtualMemoryMB -Average).Average, 2)
+            RamMB_Avg           = SafeAgg $groupData "RamMB" "Average"
+            RamMB_Max           = SafeAgg $groupData "RamMB" "Maximum"
+            RamPercent_Avg      = SafeAgg $groupData "RamPercent" "Average"
+            PrivateBytesMB_Avg  = SafeAgg $groupData "PrivateBytesMB" "Average"
+            VirtualMemoryMB_Avg = SafeAgg $groupData "VirtualMemoryMB" "Average"
             # GPU
-            GpuEnginePercent_Avg = [math]::Round(($groupData | Measure-Object -Property GpuEnginePercent -Average).Average, 2)
-            GpuMemoryMB_Avg     = [math]::Round(($groupData | Measure-Object -Property GpuMemoryMB -Average).Average, 2)
+            GpuEnginePercent_Avg = SafeAgg $groupData "GpuEnginePercent" "Average"
+            GpuMemoryMB_Avg     = SafeAgg $groupData "GpuMemoryMB" "Average"
             # IO
-            IOReadBytesPerSec_Avg  = [math]::Round(($groupData | Measure-Object -Property IOReadBytesPerSec -Average).Average, 0)
-            IOWriteBytesPerSec_Avg = [math]::Round(($groupData | Measure-Object -Property IOWriteBytesPerSec -Average).Average, 0)
+            IOReadBytesPerSec_Avg  = SafeAgg $groupData "IOReadBytesPerSec" "Average" 0
+            IOWriteBytesPerSec_Avg = SafeAgg $groupData "IOWriteBytesPerSec" "Average" 0
             # Threads / Handles
-            ThreadCount_Avg     = [math]::Round(($groupData | Measure-Object -Property ThreadCount -Average).Average, 0)
-            HandleCount_Avg     = [math]::Round(($groupData | Measure-Object -Property HandleCount -Average).Average, 0)
+            ThreadCount_Avg     = SafeAgg $groupData "ThreadCount" "Average" 0
+            HandleCount_Avg     = SafeAgg $groupData "HandleCount" "Average" 0
             # Page Faults
-            PageFaults_Avg      = [math]::Round(($groupData | Measure-Object -Property PageFaults -Average).Average, 0)
+            PageFaults_Avg      = SafeAgg $groupData "PageFaults" "Average" 0
         }
     }
 
@@ -427,7 +534,7 @@ if ($FilterPattern) {
         Group-Object -Property ProcessName |
         ForEach-Object {
             $groupName = $_.Name
-            $groupData = $_.Group
+            $groupData = @($_.Group)
             $count = $groupData.Count
 
             [PSCustomObject]@{
@@ -437,17 +544,17 @@ if ($FilterPattern) {
                 SampleCount         = $count
                 AnalysisDurationSec = $DurationSeconds
                 IntervalSec         = $IntervalSeconds
-                CpuPercent_Avg      = [math]::Round(($groupData | Measure-Object -Property CpuPercent -Average).Average, 2)
-                CpuPercent_Max      = [math]::Round(($groupData | Measure-Object -Property CpuPercent -Maximum).Maximum, 2)
-                RamMB_Avg           = [math]::Round(($groupData | Measure-Object -Property RamMB -Average).Average, 2)
-                RamMB_Max           = [math]::Round(($groupData | Measure-Object -Property RamMB -Maximum).Maximum, 2)
-                RamPercent_Avg      = [math]::Round(($groupData | Measure-Object -Property RamPercent -Average).Average, 2)
-                GpuEnginePercent_Avg = [math]::Round(($groupData | Measure-Object -Property GpuEnginePercent -Average).Average, 2)
-                GpuMemoryMB_Avg     = [math]::Round(($groupData | Measure-Object -Property GpuMemoryMB -Average).Average, 2)
-                IOReadBytesPerSec_Avg  = [math]::Round(($groupData | Measure-Object -Property IOReadBytesPerSec -Average).Average, 0)
-                IOWriteBytesPerSec_Avg = [math]::Round(($groupData | Measure-Object -Property IOWriteBytesPerSec -Average).Average, 0)
-                ThreadCount_Avg     = [math]::Round(($groupData | Measure-Object -Property ThreadCount -Average).Average, 0)
-                HandleCount_Avg     = [math]::Round(($groupData | Measure-Object -Property HandleCount -Average).Average, 0)
+                CpuPercent_Avg      = SafeAgg $groupData "CpuPercent" "Average"
+                CpuPercent_Max      = SafeAgg $groupData "CpuPercent" "Maximum"
+                RamMB_Avg           = SafeAgg $groupData "RamMB" "Average"
+                RamMB_Max           = SafeAgg $groupData "RamMB" "Maximum"
+                RamPercent_Avg      = SafeAgg $groupData "RamPercent" "Average"
+                GpuEnginePercent_Avg = SafeAgg $groupData "GpuEnginePercent" "Average"
+                GpuMemoryMB_Avg     = SafeAgg $groupData "GpuMemoryMB" "Average"
+                IOReadBytesPerSec_Avg  = SafeAgg $groupData "IOReadBytesPerSec" "Average" 0
+                IOWriteBytesPerSec_Avg = SafeAgg $groupData "IOWriteBytesPerSec" "Average" 0
+                ThreadCount_Avg     = SafeAgg $groupData "ThreadCount" "Average" 0
+                HandleCount_Avg     = SafeAgg $groupData "HandleCount" "Average" 0
             }
         }
 }
@@ -458,10 +565,27 @@ if ($FilterPattern) {
 
 Write-Host "Generation du rapport total..." -ForegroundColor Cyan
 
-$RunningData = $RawSamples | Where-Object { $_.Status -eq "Running" }
+$RunningData = @($RawSamples | Where-Object { $_.Status -eq "Running" })
 $totalCount = $RunningData.Count
 
 if ($totalCount -gt 0) {
+    # Agreger par echantillon (somme des processus par intervalle), null-safe
+    $perSampleSums = $RunningData | Group-Object SampleIndex | ForEach-Object {
+        $g = @($_.Group)
+        [PSCustomObject]@{
+            CpuSum      = SafeAgg $g "CpuPercent" "Sum"
+            RamMBSum    = SafeAgg $g "RamMB" "Sum"
+            RamPctSum   = SafeAgg $g "RamPercent" "Sum"
+            GpuEngSum   = SafeAgg $g "GpuEnginePercent" "Sum"
+            GpuMemSum   = SafeAgg $g "GpuMemoryMB" "Sum"
+            IOReadSum   = SafeAgg $g "IOReadBytesPerSec" "Sum" 0
+            IOWriteSum  = SafeAgg $g "IOWriteBytesPerSec" "Sum" 0
+            ThreadSum   = SafeAgg $g "ThreadCount" "Sum" 0
+            HandleSum   = SafeAgg $g "HandleCount" "Sum" 0
+        }
+    }
+    $pss = @($perSampleSums)
+
     $StatsTotal = [PSCustomObject]@{
         ReportType              = "Total"
         ProcessesMonitored      = ($ProcessNames -join ";")
@@ -469,22 +593,17 @@ if ($totalCount -gt 0) {
         UniqueProcesses         = ($RunningData | Select-Object -ExpandProperty ProcessName -Unique).Count
         AnalysisDurationSec     = $DurationSeconds
         IntervalSec             = $IntervalSeconds
-        # CPU agrege
-        CpuPercent_Sum_Avg      = [math]::Round(($RunningData | Group-Object SampleIndex | ForEach-Object { ($_.Group | Measure-Object -Property CpuPercent -Sum).Sum } | Measure-Object -Average).Average, 2)
-        CpuPercent_Sum_Max      = [math]::Round(($RunningData | Group-Object SampleIndex | ForEach-Object { ($_.Group | Measure-Object -Property CpuPercent -Sum).Sum } | Measure-Object -Maximum).Maximum, 2)
-        # RAM agrege
-        RamMB_Sum_Avg           = [math]::Round(($RunningData | Group-Object SampleIndex | ForEach-Object { ($_.Group | Measure-Object -Property RamMB -Sum).Sum } | Measure-Object -Average).Average, 2)
-        RamMB_Sum_Max           = [math]::Round(($RunningData | Group-Object SampleIndex | ForEach-Object { ($_.Group | Measure-Object -Property RamMB -Sum).Sum } | Measure-Object -Maximum).Maximum, 2)
-        RamPercent_Sum_Avg      = [math]::Round(($RunningData | Group-Object SampleIndex | ForEach-Object { ($_.Group | Measure-Object -Property RamPercent -Sum).Sum } | Measure-Object -Average).Average, 2)
-        # GPU agrege
-        GpuEnginePercent_Sum_Avg = [math]::Round(($RunningData | Group-Object SampleIndex | ForEach-Object { ($_.Group | Measure-Object -Property GpuEnginePercent -Sum).Sum } | Measure-Object -Average).Average, 2)
-        GpuMemoryMB_Sum_Avg     = [math]::Round(($RunningData | Group-Object SampleIndex | ForEach-Object { ($_.Group | Measure-Object -Property GpuMemoryMB -Sum).Sum } | Measure-Object -Average).Average, 2)
-        # IO agrege
-        IOReadBytesPerSec_Sum_Avg  = [math]::Round(($RunningData | Group-Object SampleIndex | ForEach-Object { ($_.Group | Measure-Object -Property IOReadBytesPerSec -Sum).Sum } | Measure-Object -Average).Average, 0)
-        IOWriteBytesPerSec_Sum_Avg = [math]::Round(($RunningData | Group-Object SampleIndex | ForEach-Object { ($_.Group | Measure-Object -Property IOWriteBytesPerSec -Sum).Sum } | Measure-Object -Average).Average, 0)
-        # Threads / Handles
-        ThreadCount_Sum_Avg     = [math]::Round(($RunningData | Group-Object SampleIndex | ForEach-Object { ($_.Group | Measure-Object -Property ThreadCount -Sum).Sum } | Measure-Object -Average).Average, 0)
-        HandleCount_Sum_Avg     = [math]::Round(($RunningData | Group-Object SampleIndex | ForEach-Object { ($_.Group | Measure-Object -Property HandleCount -Sum).Sum } | Measure-Object -Average).Average, 0)
+        CpuPercent_Sum_Avg      = SafeAgg $pss "CpuSum" "Average"
+        CpuPercent_Sum_Max      = SafeAgg $pss "CpuSum" "Maximum"
+        RamMB_Sum_Avg           = SafeAgg $pss "RamMBSum" "Average"
+        RamMB_Sum_Max           = SafeAgg $pss "RamMBSum" "Maximum"
+        RamPercent_Sum_Avg      = SafeAgg $pss "RamPctSum" "Average"
+        GpuEnginePercent_Sum_Avg = SafeAgg $pss "GpuEngSum" "Average"
+        GpuMemoryMB_Sum_Avg     = SafeAgg $pss "GpuMemSum" "Average"
+        IOReadBytesPerSec_Sum_Avg  = SafeAgg $pss "IOReadSum" "Average" 0
+        IOWriteBytesPerSec_Sum_Avg = SafeAgg $pss "IOWriteSum" "Average" 0
+        ThreadCount_Sum_Avg     = SafeAgg $pss "ThreadSum" "Average" 0
+        HandleCount_Sum_Avg     = SafeAgg $pss "HandleSum" "Average" 0
     }
 }
 
@@ -525,7 +644,7 @@ if ($ExportFormat -eq "JSON" -or $ExportFormat -eq "Both") {
             GeneratedAt       = (Get-Date).ToString("o")
             MachineName       = $env:COMPUTERNAME
             LogicalProcessors = $LogicalProcessors
-            TotalRamGB        = [math]::Round($TotalRamBytes / 1GB, 2)
+            TotalRamGB        = if ($null -ne $TotalRamBytes) { [math]::Round($TotalRamBytes / 1GB, 2) } else { $null }
             DurationSeconds   = $DurationSeconds
             IntervalSeconds   = $IntervalSeconds
             ProcessesMonitored = $ProcessNames
@@ -556,11 +675,11 @@ if ($StatsPerProcess) {
     foreach ($stat in $StatsPerProcess) {
         Write-Host ""
         Write-Host "  $($stat.ProcessName)" -ForegroundColor Yellow
-        Write-Host "    CPU  : Avg=$($stat.CpuPercent_Avg)%  Max=$($stat.CpuPercent_Max)%  P95=$($stat.CpuPercent_P95)%"
-        Write-Host "    RAM  : Avg=$($stat.RamMB_Avg) MB ($($stat.RamPercent_Avg)%)  Max=$($stat.RamMB_Max) MB"
-        Write-Host "    GPU  : Engine=$($stat.GpuEnginePercent_Avg)%  VRAM=$($stat.GpuMemoryMB_Avg) MB"
-        Write-Host "    IO   : Read=$($stat.IOReadBytesPerSec_Avg) B/s  Write=$($stat.IOWriteBytesPerSec_Avg) B/s"
-        Write-Host "    Misc : Threads=$($stat.ThreadCount_Avg)  Handles=$($stat.HandleCount_Avg)  PageFaults=$($stat.PageFaults_Avg)/s"
+        Write-Host "    CPU  : Avg=$(Format-Val $stat.CpuPercent_Avg '%')  Max=$(Format-Val $stat.CpuPercent_Max '%')  P95=$(Format-Val $stat.CpuPercent_P95 '%')"
+        Write-Host "    RAM  : Avg=$(Format-Val $stat.RamMB_Avg ' MB') ($(Format-Val $stat.RamPercent_Avg '%'))  Max=$(Format-Val $stat.RamMB_Max ' MB')"
+        Write-Host "    GPU  : Engine=$(Format-Val $stat.GpuEnginePercent_Avg '%')  VRAM=$(Format-Val $stat.GpuMemoryMB_Avg ' MB')"
+        Write-Host "    IO   : Read=$(Format-Val $stat.IOReadBytesPerSec_Avg ' B/s')  Write=$(Format-Val $stat.IOWriteBytesPerSec_Avg ' B/s')"
+        Write-Host "    Misc : Threads=$(Format-Val $stat.ThreadCount_Avg)  Handles=$(Format-Val $stat.HandleCount_Avg)  PageFaults=$(Format-Val $stat.PageFaults_Avg '/s')"
     }
 }
 else {
@@ -572,11 +691,11 @@ if ($StatsTotal) {
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host " RESUME - Total (tous processus)" -ForegroundColor Cyan
     Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host "    CPU Total  : Avg=$($StatsTotal.CpuPercent_Sum_Avg)%  Max=$($StatsTotal.CpuPercent_Sum_Max)%"
-    Write-Host "    RAM Total  : Avg=$($StatsTotal.RamMB_Sum_Avg) MB ($($StatsTotal.RamPercent_Sum_Avg)%)  Max=$($StatsTotal.RamMB_Sum_Max) MB"
-    Write-Host "    GPU Total  : Engine=$($StatsTotal.GpuEnginePercent_Sum_Avg)%  VRAM=$($StatsTotal.GpuMemoryMB_Sum_Avg) MB"
-    Write-Host "    IO Total   : Read=$($StatsTotal.IOReadBytesPerSec_Sum_Avg) B/s  Write=$($StatsTotal.IOWriteBytesPerSec_Sum_Avg) B/s"
-    Write-Host "    Misc Total : Threads=$($StatsTotal.ThreadCount_Sum_Avg)  Handles=$($StatsTotal.HandleCount_Sum_Avg)"
+    Write-Host "    CPU Total  : Avg=$(Format-Val $StatsTotal.CpuPercent_Sum_Avg '%')  Max=$(Format-Val $StatsTotal.CpuPercent_Sum_Max '%')"
+    Write-Host "    RAM Total  : Avg=$(Format-Val $StatsTotal.RamMB_Sum_Avg ' MB') ($(Format-Val $StatsTotal.RamPercent_Sum_Avg '%'))  Max=$(Format-Val $StatsTotal.RamMB_Sum_Max ' MB')"
+    Write-Host "    GPU Total  : Engine=$(Format-Val $StatsTotal.GpuEnginePercent_Sum_Avg '%')  VRAM=$(Format-Val $StatsTotal.GpuMemoryMB_Sum_Avg ' MB')"
+    Write-Host "    IO Total   : Read=$(Format-Val $StatsTotal.IOReadBytesPerSec_Sum_Avg ' B/s')  Write=$(Format-Val $StatsTotal.IOWriteBytesPerSec_Sum_Avg ' B/s')"
+    Write-Host "    Misc Total : Threads=$(Format-Val $StatsTotal.ThreadCount_Sum_Avg)  Handles=$(Format-Val $StatsTotal.HandleCount_Sum_Avg)"
 }
 
 Write-Host ""
