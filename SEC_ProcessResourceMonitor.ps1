@@ -73,24 +73,62 @@ function Get-ProcessCpuPercent {
     <#
     .SYNOPSIS
         Calcule le pourcentage CPU d'un processus entre deux releves.
+        Utilise le temps reel ecoule et Refresh() pour des valeurs fiables.
     #>
     param(
         [System.Diagnostics.Process]$Process,
         [hashtable]$PreviousCpuTimes,
-        [double]$ElapsedSeconds,
+        [datetime]$PreviousTimestamp,
+        [datetime]$CurrentTimestamp,
         [int]$LogicalProcessors
     )
 
-    $pid_key = "$($Process.Id)"
-    $currentCpu = $Process.TotalProcessorTime.TotalMilliseconds
+    # Cle composite PID + StartTime pour detecter les recyclages de PID
+    $startTimeTicks = 0
+    try { $startTimeTicks = $Process.StartTime.Ticks } catch { }
+    $pid_key = "$($Process.Id)_$startTimeTicks"
+
+    # Refresh() force la relecture des compteurs CPU depuis l'OS
+    try { $Process.Refresh() } catch { }
+
+    $currentCpu = 0.0
+    try {
+        $currentCpu = $Process.TotalProcessorTime.TotalMilliseconds
+    }
+    catch {
+        # Processus protege (SYSTEM, antivirus, etc.) : fallback compteur perf
+        try {
+            $counterPath = "\Process($($Process.Name))\% Processor Time"
+            $sample = (Get-Counter -Counter $counterPath -ErrorAction Stop).CounterSamples[0].CookedValue
+            # Get-Counter retourne un % sur N cores (ex: 200% = 2 cores a fond)
+            # On normalise sur 100%
+            return [math]::Round($sample / $LogicalProcessors, 2)
+        }
+        catch {
+            if ($PreviousCpuTimes.ContainsKey($pid_key)) {
+                $PreviousCpuTimes.Remove($pid_key)
+            }
+            return 0.0
+        }
+    }
 
     if ($PreviousCpuTimes.ContainsKey($pid_key)) {
-        $deltaCpu = $currentCpu - $PreviousCpuTimes[$pid_key]
-        $cpuPercent = ($deltaCpu / ($ElapsedSeconds * 1000 * $LogicalProcessors)) * 100
+        $deltaCpuMs = $currentCpu - $PreviousCpuTimes[$pid_key]
+        $deltaTimeMs = ($CurrentTimestamp - $PreviousTimestamp).TotalMilliseconds
+
+        if ($deltaTimeMs -gt 0 -and $deltaCpuMs -ge 0) {
+            $cpuPercent = ($deltaCpuMs / ($deltaTimeMs * $LogicalProcessors)) * 100
+        }
+        else {
+            $cpuPercent = 0
+        }
+
+        # Clamp entre 0 et 100
         if ($cpuPercent -lt 0) { $cpuPercent = 0 }
         if ($cpuPercent -gt 100) { $cpuPercent = 100 }
     }
     else {
+        # Premier releve pour ce processus : on enregistre la baseline, pas de calcul
         $cpuPercent = 0
     }
 
@@ -201,6 +239,29 @@ catch {
 
 $RawSamples = [System.Collections.ArrayList]::new()
 $PreviousCpuTimes = @{}
+$PreviousTimestamp = Get-Date
+
+# --- Phase de baseline : enregistrer le TotalProcessorTime initial de chaque processus ---
+# Cela permet d'avoir un vrai delta CPU des le premier echantillon.
+Write-Host "Initialisation des baselines CPU..." -ForegroundColor DarkGray
+foreach ($procName in $ProcessNames) {
+    $processes = Get-Process -Name $procName -ErrorAction SilentlyContinue
+    if ($processes) {
+        foreach ($proc in $processes) {
+            try { $proc.Refresh() } catch { }
+            $startTimeTicks = 0
+            try { $startTimeTicks = $proc.StartTime.Ticks } catch { }
+            $pid_key = "$($proc.Id)_$startTimeTicks"
+            try {
+                $PreviousCpuTimes[$pid_key] = $proc.TotalProcessorTime.TotalMilliseconds
+            }
+            catch { }
+        }
+    }
+}
+Start-Sleep -Seconds $IntervalSeconds
+$PreviousTimestamp = Get-Date
+
 $StartTime = Get-Date
 $SampleIndex = 0
 
@@ -239,10 +300,11 @@ while ((Get-Date) -lt $StartTime.AddSeconds($DurationSeconds)) {
         }
 
         foreach ($proc in $processes) {
-            # CPU
+            # CPU — utilise le vrai temps ecoule entre echantillons
             $cpuPercent = Get-ProcessCpuPercent -Process $proc `
                 -PreviousCpuTimes $PreviousCpuTimes `
-                -ElapsedSeconds $IntervalSeconds `
+                -PreviousTimestamp $PreviousTimestamp `
+                -CurrentTimestamp $SampleTimestamp `
                 -LogicalProcessors $LogicalProcessors
 
             # RAM
@@ -291,6 +353,9 @@ while ((Get-Date) -lt $StartTime.AddSeconds($DurationSeconds)) {
             [void]$RawSamples.Add($sample)
         }
     }
+
+    # Mise a jour du timestamp precedent pour le calcul du delta CPU reel
+    $PreviousTimestamp = $SampleTimestamp
 
     # Progression
     $elapsed = ((Get-Date) - $StartTime).TotalSeconds
